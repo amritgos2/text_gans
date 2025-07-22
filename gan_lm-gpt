@@ -1,0 +1,170 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, AutoModel, GPT2Tokenizer, GPT2LMHeadModel, get_linear_schedule_with_warmup
+from datasets import load_dataset
+
+# Device setup
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+class Generator(nn.Module):
+    def __init__(self, lm_name="bert-base-uncased", latent_dim=768):
+        super().__init__()
+        self.encoder = AutoModel.from_pretrained(lm_name)
+        self.fc = nn.Linear(latent_dim, latent_dim)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = outputs.last_hidden_state.mean(dim=1)
+        generated_embedding = self.dropout(self.fc(pooled))
+        return generated_embedding
+
+
+class Discriminator(nn.Module):
+    def __init__(self, embedding_dim=768):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(embedding_dim, 512),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.1),
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.1),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, embeddings):
+        return self.model(embeddings)
+
+
+class GPTDecoder:
+    def __init__(self, gpt_name="gpt2", device=device):
+        self.tokenizer = GPT2Tokenizer.from_pretrained(gpt_name)
+        self.model = GPT2LMHeadModel.from_pretrained(gpt_name).to(device)
+        self.device = device
+
+    def decode(self, prompt, max_length=50, num_return_sequences=1):
+        input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device)
+        outputs = self.model.generate(
+            input_ids,
+            max_length=max_length,
+            num_return_sequences=num_return_sequences,
+            do_sample=True,
+            top_k=50,
+            top_p=0.95,
+            temperature=0.9,
+            no_repeat_ngram_size=2,
+            early_stopping=True
+        )
+        return [self.tokenizer.decode(out, skip_special_tokens=True) for out in outputs]
+
+
+def collate_fn(batch, tokenizer, max_length=64):
+    texts_1 = [item['sentence1'] for item in batch]
+    texts_2 = [item['sentence2'] for item in batch]
+
+    enc1 = tokenizer(texts_1, padding='max_length', truncation=True, max_length=max_length, return_tensors='pt')
+    enc2 = tokenizer(texts_2, padding='max_length', truncation=True, max_length=max_length, return_tensors='pt')
+
+    return enc1, enc2
+
+
+def train_gan_lm(generator, discriminator, dataloader, optimizer_g, optimizer_d, scheduler_g, scheduler_d, device, epochs=5):
+    bce = nn.BCELoss()
+    generator.train()
+    discriminator.train()
+
+    for epoch in range(epochs):
+        for batch_idx, (real_enc, para_enc) in enumerate(dataloader):
+            real_input_ids, real_attention = real_enc['input_ids'].to(device), real_enc['attention_mask'].to(device)
+            para_input_ids, para_attention = para_enc['input_ids'].to(device), para_enc['attention_mask'].to(device)
+
+            # Generate embeddings for paraphrases (real) and generated
+            real_embeddings = generator.encoder(input_ids=para_input_ids, attention_mask=para_attention).last_hidden_state.mean(dim=1)
+            fake_embeddings = generator(real_input_ids, real_attention)
+
+            # Train Discriminator
+            optimizer_d.zero_grad()
+            real_labels = torch.ones(real_embeddings.size(0), 1).to(device)
+            fake_labels = torch.zeros(fake_embeddings.size(0), 1).to(device)
+
+            output_real = discriminator(real_embeddings)
+            output_fake = discriminator(fake_embeddings.detach())
+
+            loss_d_real = bce(output_real, real_labels)
+            loss_d_fake = bce(output_fake, fake_labels)
+            loss_d = (loss_d_real + loss_d_fake) * 0.5
+            loss_d.backward()
+            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+            optimizer_d.step()
+            scheduler_d.step()
+
+            # Train Generator
+            optimizer_g.zero_grad()
+            output_fake_for_g = discriminator(fake_embeddings)
+            loss_g = bce(output_fake_for_g, real_labels)  # wants discriminator to predict real
+
+            loss_g.backward()
+            torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
+            optimizer_g.step()
+            scheduler_g.step()
+
+            if batch_idx % 100 == 0:
+                print(f"Epoch {epoch+1}/{epochs} Batch {batch_idx} | D_loss: {loss_d.item():.4f} | G_loss: {loss_g.item():.4f}")
+
+    print("Finished training GAN-LM.")
+
+
+def main():
+    # Load dataset: Example using Quora dataset (sentence pairs)
+    dataset = load_dataset("quora", split="train[:5%]")  # small subset for quick testing
+
+    bert_name = "bert-base-uncased"
+    gpt_name = "gpt2"
+
+    bert_tokenizer = AutoTokenizer.from_pretrained(bert_name)
+    generator = Generator(lm_name=bert_name).to(device)
+    discriminator = Discriminator().to(device)
+    gpt_decoder = GPTDecoder(gpt_name=gpt_name, device=device)
+
+    batch_size = 16
+    epochs = 3
+
+    # Prepare DataLoader
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=lambda x: collate_fn(x, bert_tokenizer)
+    )
+
+    # Optimizers and schedulers
+    optimizer_g = torch.optim.Adam(generator.parameters(), lr=2e-5, betas=(0.9, 0.999))
+    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=2e-5, betas=(0.9, 0.999))
+
+    total_steps = epochs * len(dataloader)
+    scheduler_g = get_linear_schedule_with_warmup(optimizer_g, num_warmup_steps=total_steps//10, num_training_steps=total_steps)
+    scheduler_d = get_linear_schedule_with_warmup(optimizer_d, num_warmup_steps=total_steps//10, num_training_steps=total_steps)
+
+    # Train GAN-LM (Generator and Discriminator)
+    train_gan_lm(generator, discriminator, dataloader, optimizer_g, optimizer_d, scheduler_g, scheduler_d, device, epochs=epochs)
+
+    # Example inference: generate embeddings and decode with GPT
+    test_sentence = "Why do heavier objects travel downhill faster?"
+    inputs = bert_tokenizer(test_sentence, return_tensors='pt').to(device)
+    with torch.no_grad():
+        gen_embedding = generator(inputs['input_ids'], inputs['attention_mask'])
+
+    # Use a prompt related to the test sentence for GPT decoding (creative step)
+    prompt = f"Paraphrase: {test_sentence}"
+    paraphrases = gpt_decoder.decode(prompt, num_return_sequences=3)
+    print("\nGenerated Paraphrases by GPT:")
+    for i, para in enumerate(paraphrases):
+        print(f"{i+1}: {para}")
+
+
+if __name__ == "__main__":
+    main()
